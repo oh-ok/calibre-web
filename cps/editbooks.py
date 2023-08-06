@@ -27,9 +27,10 @@ from shutil import copyfile
 from uuid import uuid4
 from markupsafe import escape  # dependency of flask
 from functools import wraps
+import re
 
 try:
-    from lxml.html.clean import clean_html
+    from lxml.html.clean import clean_html, Cleaner
 except ImportError:
     clean_html = None
 
@@ -40,6 +41,7 @@ from flask_babel import get_locale
 from flask_login import current_user, login_required
 from sqlalchemy.exc import OperationalError, IntegrityError, InterfaceError
 from sqlalchemy.orm.exc import StaleDataError
+from sqlalchemy.sql.expression import func
 
 from . import constants, logger, isoLanguages, gdriveutils, uploader, helper, kobo_sync_status
 from . import config, ub, db, calibre_db
@@ -470,7 +472,7 @@ def get_sorted_entry(field, bookid):
             if field == 'sort':
                 return json.dumps({'sort': book.title})
             if field == 'author_sort':
-                return json.dumps({'author_sort': book.author})
+                return json.dumps({'authors': " & ".join([a.name for a in calibre_db.order_authors([book])])})
     return ""
 
 
@@ -598,6 +600,8 @@ def identifier_list(to_save, book):
         val_key = id_val_prefix + type_key[len(id_type_prefix):]
         if val_key not in to_save.keys():
             continue
+        if to_save[val_key].startswith("data:"):
+            to_save[val_key], __, __ = str.partition(to_save[val_key], ",")
         result.append(db.Identifiers(to_save[val_key], type_value, book.id))
     return result
 
@@ -1245,18 +1249,18 @@ def handle_title_on_edit(book, book_title):
 
 
 def handle_author_on_edit(book, author_name, update_stored=True):
+    change = False
     # handle author(s)
     input_authors, renamed = prepare_authors(author_name)
 
-    change = modify_database_object(input_authors, book.authors, db.Authors, calibre_db.session, 'author')
-
+    # change |= modify_database_object(input_authors, book.authors, db.Authors, calibre_db.session, 'author')
     # Search for each author if author is in database, if not, author name and sorted author name is generated new
     # everything then is assembled for sorted author field in database
     sort_authors_list = list()
     for inp in input_authors:
         stored_author = calibre_db.session.query(db.Authors).filter(db.Authors.name == inp).first()
         if not stored_author:
-            stored_author = helper.get_sorted_author(inp)
+            stored_author = helper.get_sorted_author(inp.replace('|', ','))
         else:
             stored_author = stored_author.sort
         sort_authors_list.append(helper.get_sorted_author(stored_author))
@@ -1264,6 +1268,9 @@ def handle_author_on_edit(book, author_name, update_stored=True):
     if book.author_sort != sort_authors and update_stored:
         book.author_sort = sort_authors
         change = True
+
+    change |= modify_database_object(input_authors, book.authors, db.Authors, calibre_db.session, 'author')
+
     return input_authors, change, renamed
 
 
@@ -1271,14 +1278,15 @@ def search_objects_remove(db_book_object, db_type, input_elements):
     del_elements = []
     for c_elements in db_book_object:
         found = False
-        if db_type == 'languages':
-            type_elements = c_elements.lang_code
-        elif db_type == 'custom':
+        #if db_type == 'languages':
+        #    type_elements = c_elements.lang_code
+        if db_type == 'custom':
             type_elements = c_elements.value
         else:
-            type_elements = c_elements.name
+            # type_elements = c_elements.name
+            type_elements = c_elements
         for inp_element in input_elements:
-            if inp_element.lower() == type_elements.lower():
+            if type_elements == inp_element:
                 found = True
                 break
         # if the element was not found in the new list, add it to remove list
@@ -1292,13 +1300,11 @@ def search_objects_add(db_book_object, db_type, input_elements):
     for inp_element in input_elements:
         found = False
         for c_elements in db_book_object:
-            if db_type == 'languages':
-                type_elements = c_elements.lang_code
-            elif db_type == 'custom':
+            if db_type == 'custom':
                 type_elements = c_elements.value
             else:
-                type_elements = c_elements.name
-            if inp_element == type_elements:
+                type_elements = c_elements
+            if type_elements == inp_element:
                 found = True
                 break
         if not found:
@@ -1314,6 +1320,7 @@ def remove_objects(db_book_object, db_session, del_elements):
             changed = True
             if len(del_element.books) == 0:
                 db_session.delete(del_element)
+                db_session.flush()
     return changed
 
 
@@ -1327,27 +1334,34 @@ def add_objects(db_book_object, db_object, db_session, db_type, add_elements):
         db_filter = db_object.name
     for add_element in add_elements:
         # check if an element with that name exists
-        db_element = db_session.query(db_object).filter(db_filter == add_element).first()
+        changed = True
+        # db_session.query(db.Tags).filter((func.lower(db.Tags.name).ilike("GênOt"))).all()
+        db_element = db_session.query(db_object).filter((func.lower(db_filter).ilike(add_element))).first()
+        # db_element = db_session.query(db_object).filter(func.lower(db_filter) == add_element.lower()).first()
         # if no element is found add it
-        if db_type == 'author':
-            new_element = db_object(add_element, helper.get_sorted_author(add_element.replace('|', ',')), "")
-        elif db_type == 'series':
-            new_element = db_object(add_element, add_element)
-        elif db_type == 'custom':
-            new_element = db_object(value=add_element)
-        elif db_type == 'publisher':
-            new_element = db_object(add_element, None)
-        else:  # db_type should be tag or language
-            new_element = db_object(add_element)
         if db_element is None:
-            changed = True
+            if db_type == 'author':
+                new_element = db_object(add_element, helper.get_sorted_author(add_element.replace('|', ',')))
+            elif db_type == 'series':
+                new_element = db_object(add_element, add_element)
+            elif db_type == 'custom':
+                new_element = db_object(value=add_element)
+            elif db_type == 'publisher':
+                new_element = db_object(add_element, None)
+            else:  # db_type should be tag or language
+                new_element = db_object(add_element)
             db_session.add(new_element)
             db_book_object.append(new_element)
         else:
-            db_element = create_objects_for_addition(db_element, add_element, db_type)
+            db_no_case = db_session.query(db_object).filter(db_filter == add_element).first()
+            if db_no_case:
+                # check for new case of element
+                db_element = create_objects_for_addition(db_element, add_element, db_type)
+            else:
+                db_element = create_objects_for_addition(db_element, add_element, db_type)
             # add element to book
-            changed = True
             db_book_object.append(db_element)
+
     return changed
 
 
@@ -1382,13 +1396,24 @@ def modify_database_object(input_elements, db_book_object, db_object, db_session
     if not isinstance(input_elements, list):
         raise TypeError(str(input_elements) + " should be passed as a list")
     input_elements = [x for x in input_elements if x != '']
-    # we have all input element (authors, series, tags) names now
+
+    changed = False
+    # If elements are renamed (upper lower case), rename it
+    for rec_a, rec_b in zip(db_book_object, input_elements):
+        if db_type == "custom":
+            if rec_a.value.casefold() == rec_b.casefold() and rec_a.value != rec_b:
+                create_objects_for_addition(rec_a, rec_b, db_type)
+        else:
+            if rec_a.get().casefold() == rec_b.casefold() and rec_a.get() != rec_b:
+                create_objects_for_addition(rec_a, rec_b, db_type)
+        # we have all input element (authors, series, tags) names now
     # 1. search for elements to remove
     del_elements = search_objects_remove(db_book_object, db_type, input_elements)
     # 2. search for elements that need to be added
     add_elements = search_objects_add(db_book_object, db_type, input_elements)
+
     # if there are elements to remove, we remove them now
-    changed = remove_objects(db_book_object, db_session, del_elements)
+    changed |= remove_objects(db_book_object, db_session, del_elements)
     # if there are elements to add, we add them now!
     if len(add_elements) > 0:
         changed |= add_objects(db_book_object, db_object, db_session, db_type, add_elements)

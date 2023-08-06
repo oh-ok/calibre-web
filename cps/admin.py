@@ -33,6 +33,7 @@ from functools import wraps
 from urllib.parse import urlparse
 
 from flask import Blueprint, flash, redirect, url_for, abort, request, make_response, send_from_directory, g, Response
+from flask import Markup
 from flask_login import login_required, current_user, logout_user
 from flask_babel import gettext as _
 from flask_babel import get_locale, format_time, format_datetime, format_timedelta
@@ -1035,7 +1036,8 @@ def pathchooser():
 
     for f in folders:
         try:
-            data = {"name": f, "fullpath": os.path.join(cwd, f)}
+            sanitized_f = str(Markup.escape(f))
+            data = {"name": sanitized_f, "fullpath": os.path.join(cwd, sanitized_f)}
             data["sort"] = data["fullpath"].lower()
         except Exception:
             continue
@@ -1294,7 +1296,8 @@ def update_mailsettings():
     else:
         _config_int(to_save, "mail_port")
         _config_int(to_save, "mail_use_ssl")
-        _config_string(to_save, "mail_password_e")
+        if to_save.get("mail_password_e", ""):
+            _config_string(to_save, "mail_password_e")
         _config_int(to_save, "mail_size", lambda y: int(y) * 1024 * 1024)
         config.mail_server = to_save.get('mail_server', "").strip()
         config.mail_from = to_save.get('mail_from', "").strip()
@@ -1778,7 +1781,8 @@ def _configuration_update_helper():
         # Goodreads configuration
         _config_checkbox(to_save, "config_use_goodreads")
         _config_string(to_save, "config_goodreads_api_key")
-        _config_string(to_save, "config_goodreads_api_secret_e")
+        if to_save.get("config_goodreads_api_secret_e", ""):
+            _config_string(to_save, "config_goodreads_api_secret_e")
         if services.goodreads_support:
             services.goodreads_support.connect(config.config_goodreads_api_key,
                                                config.config_goodreads_api_secret_e,
